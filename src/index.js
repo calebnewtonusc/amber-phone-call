@@ -1,7 +1,7 @@
 import "dotenv/config";
 import express from "express";
 import { voiceRouter } from "./routes/voice.js";
-import { toolsRouter } from "./routes/tools.js";
+import { audioRouter } from "./routes/audio.js";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -13,14 +13,19 @@ app.get("/", (_req, res) => {
   res.json({
     service: "amber-phone-call",
     status: "ok",
-    routes: ["/voice/incoming", "/voice/status", "/tools/*"],
+    routes: [
+      "/voice/incoming",
+      "/voice/respond",
+      "/voice/status",
+      "/audio/:id",
+    ],
   });
 });
 
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
 app.use("/voice", voiceRouter);
-app.use("/tools", toolsRouter);
+app.use("/audio", audioRouter);
 
 app.use((err, _req, res, _next) => {
   console.error("[error]", err);

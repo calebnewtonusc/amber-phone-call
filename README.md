@@ -1,60 +1,91 @@
 # amber-phone-call
 
-Voice gateway for Amber. A Twilio phone number accepts incoming calls, this server hands the audio stream to ElevenLabs Conversational AI, and the agent calls back into Amber's brain for tools like contact lookup, Todoist, and health snapshots.
+Voice adapter for Amber. A caller dials the Twilio number, this server orchestrates the conversation with the real Amber brain (hosted by `amber-agent`: Claude, Perplexity embeddings for relational memory, Perplexity search for deep research, plus every other Amber tool), and ElevenLabs synthesizes Amber's voice back to the caller.
 
-## How it works
+This repo is intentionally thin. It is not a brain. It is a microphone and a speaker wired to Amber.
+
+## Flow
 
 ```
 caller dials Twilio number
         │
         ▼
-  Twilio webhook
-        │  (POST /voice/incoming)
-        ▼
-amber-phone-call returns TwiML
-with <Connect><Stream> to
-wss://api.elevenlabs.io/v1/convai/conversation
+  Twilio POST /voice/incoming
         │
         ▼
-ElevenLabs Conversational AI
-(STT + LLM + TTS, single pipeline)
-        │
-        ▼ (server tools)
-POST /tools/lookup-contact
-POST /tools/todays-tasks
-POST /tools/health-snapshot
-POST /tools/remember
+  amber-phone-call
+    - greet the caller with ElevenLabs TTS
+    - <Gather input="speech"> for the caller's turn
         │
         ▼
-amber-agent brain
+  Twilio POST /voice/respond (with SpeechResult transcript)
+        │
+        ▼
+  amber-phone-call
+    - POST transcript to amber-agent /api/voice-turn
+      (Claude + Perplexity embeddings + Perplexity search
+       + Todoist + Calendar + health + Clay + GitHub)
+    - ElevenLabs TTS on the reply text
+    - cache audio in memory, serve via /audio/:id
+    - <Play> the audio URL, then <Gather> again
+        │
+        └── loop until caller hangs up
+        │
+        ▼
+  Twilio POST /voice/status (completed)
+        │
+        ▼
+  amber-phone-call POSTs /api/voice-turn/end so the brain can
+  flush conversation state and embed the transcript.
 ```
+
+## Routes
+
+| Route             | Method | Purpose                                         |
+| ----------------- | ------ | ----------------------------------------------- |
+| `/`               | GET    | Service info                                    |
+| `/health`         | GET    | Railway liveness                                |
+| `/voice/incoming` | POST   | Twilio entrypoint. Greets and opens Gather.     |
+| `/voice/respond`  | POST   | Receives SpeechResult, asks Amber, plays reply. |
+| `/voice/status`   | POST   | Call lifecycle. Ends brain session on hangup.   |
+| `/audio/:id`      | GET    | Serves generated ElevenLabs audio to Twilio.    |
+
+## Contract with amber-agent
+
+`amber-phone-call` expects two endpoints on the backend:
+
+```
+POST /api/voice-turn
+  body: { callSid, caller, userText, channel: "phone" }
+  headers: Authorization: Bearer ${AMBER_AGENT_SECRET}
+  returns: { reply: string }
+
+POST /api/voice-turn/end
+  body: { callSid }
+  headers: Authorization: Bearer ${AMBER_AGENT_SECRET}
+  returns: any 2xx
+```
+
+Until those land on the backend, set `AMBER_AGENT_URL` empty and the adapter will respond with a placeholder so the line stays alive for testing.
 
 ## Setup
 
-1. Clone and install
+1. Clone, install, copy `.env`
 
 ```
 npm install
 cp .env.example .env
 ```
 
-2. Fill in `.env` with Twilio creds, ElevenLabs API key and agent ID, and the URL of your running `amber-agent` backend.
+2. Fill env vars. At minimum: `TWILIO_AUTH_TOKEN`, `ELEVENLABS_API_KEY`, `PUBLIC_URL`.
 
-3. Create an ElevenLabs Conversational AI agent at https://elevenlabs.io/app/conversational-ai. Give it Amber's system prompt, pick a voice (Rachel is the default), and register the four server tools under Tools:
-   - `lookup_contact` -> `POST {PUBLIC_URL}/tools/lookup-contact`
-   - `todays_tasks` -> `POST {PUBLIC_URL}/tools/todays-tasks`
-   - `health_snapshot` -> `POST {PUBLIC_URL}/tools/health-snapshot`
-   - `remember` -> `POST {PUBLIC_URL}/tools/remember`
+3. Deploy (Railway, Fly, anywhere with HTTPS).
 
-   Add `Authorization: Bearer <TOOL_WEBHOOK_SECRET>` on each.
+4. In Twilio console, on your phone number:
+   - A call comes in: Webhook POST `https://YOUR-DOMAIN/voice/incoming`
+   - Call status changes: `https://YOUR-DOMAIN/voice/status`
 
-4. Deploy to Railway (or anywhere that gives you HTTPS). Set env vars in the dashboard.
-
-5. In the Twilio console, under Phone Numbers -> your number -> Voice Configuration:
-   - A call comes in: `Webhook` -> `https://YOUR-DOMAIN/voice/incoming` (HTTP POST)
-   - Call status changes: `https://YOUR-DOMAIN/voice/status` (HTTP POST)
-
-6. Call the Twilio number. Amber picks up.
+5. Dial the number. Amber picks up.
 
 ## Local dev
 
@@ -62,23 +93,6 @@ cp .env.example .env
 npm run dev
 ```
 
-Expose port 3000 with ngrok and set `PUBLIC_URL` + Twilio webhook to the ngrok URL. Set `SKIP_TWILIO_SIGNATURE=true` while testing.
-
-## Routes
-
-| Route                    | Method | Purpose                                                     |
-| ------------------------ | ------ | ----------------------------------------------------------- |
-| `/`                      | GET    | Health info                                                 |
-| `/health`                | GET    | Liveness check for Railway                                  |
-| `/voice/incoming`        | POST   | Twilio voice webhook, returns TwiML to stream to ElevenLabs |
-| `/voice/status`          | POST   | Twilio call status callback                                 |
-| `/tools/lookup-contact`  | POST   | ElevenLabs tool: fetch contact context from Amber           |
-| `/tools/todays-tasks`    | POST   | ElevenLabs tool: Todoist tasks for today                    |
-| `/tools/health-snapshot` | POST   | ElevenLabs tool: latest health data                         |
-| `/tools/remember`        | POST   | ElevenLabs tool: persist a memo from the call               |
-
-## Environment
-
-See `.env.example` for the full list. Required at minimum: `TWILIO_AUTH_TOKEN`, `ELEVENLABS_AGENT_ID`, `PUBLIC_URL`.
+Expose port 3000 with ngrok, set `PUBLIC_URL` to the ngrok URL, set `SKIP_TWILIO_SIGNATURE=true`, and point Twilio at the ngrok `/voice/incoming`.
 
 All glory to God! ✝️❤️

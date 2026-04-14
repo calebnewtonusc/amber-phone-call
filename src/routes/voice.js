@@ -1,5 +1,8 @@
 import express from "express";
 import twilio from "twilio";
+import { askAmber, endSession } from "../lib/brain.js";
+import { synthesize } from "../lib/tts.js";
+import { putAudio } from "../lib/audioCache.js";
 
 const { twiml: Twiml, validateRequest } = twilio;
 
@@ -17,49 +20,108 @@ function verifyTwilio(req, res, next) {
     req.body,
   );
   if (!valid) {
-    console.warn("[voice] rejected: invalid Twilio signature", { url });
+    console.warn("[voice] rejected: invalid Twilio signature");
     return res.status(403).send("Forbidden");
   }
   return next();
 }
 
-// Twilio hits this when a call comes in. We return TwiML that
-// opens a bidirectional stream to ElevenLabs Conversational AI.
-voiceRouter.post("/incoming", verifyTwilio, (req, res) => {
-  const { From, To, CallSid } = req.body;
-  console.log("[voice] incoming call", { From, To, CallSid });
+function baseUrl() {
+  return process.env.PUBLIC_URL || "";
+}
 
-  const agentId = process.env.ELEVENLABS_AGENT_ID;
-  if (!agentId) {
-    const voice = new Twiml.VoiceResponse();
-    voice.say(
-      "Amber is not configured yet. Please set the ElevenLabs agent ID. Goodbye.",
-    );
-    voice.hangup();
-    return res.type("text/xml").send(voice.toString());
-  }
-
-  const voice = new Twiml.VoiceResponse();
-  const connect = voice.connect();
-  const stream = connect.stream({
-    url: `wss://api.elevenlabs.io/v1/convai/conversation?agent_id=${agentId}`,
+// Attach a Gather for speech input. Twilio transcribes what the
+// caller says and POSTs it to /voice/respond.
+function gatherSpeech(voice) {
+  voice.gather({
+    input: "speech",
+    action: "/voice/respond",
+    method: "POST",
+    speechTimeout: "auto",
+    speechModel: "phone_call",
+    language: "en-US",
+    actionOnEmptyResult: true,
   });
-  // Pass caller identity through so the agent can personalize.
-  stream.parameter({ name: "caller", value: From || "unknown" });
-  stream.parameter({ name: "twilio_call_sid", value: CallSid || "" });
+  return voice;
+}
 
-  res.type("text/xml").send(voice.toString());
+async function playReply(voice, text) {
+  try {
+    const { audio, contentType } = await synthesize(text);
+    const id = putAudio(audio, contentType);
+    voice.play(`${baseUrl()}/audio/${id}`);
+  } catch (err) {
+    console.error("[voice] tts failed, falling back to Say", err.message);
+    voice.say({ voice: "Polly.Joanna" }, text);
+  }
+}
+
+// Twilio hits this when a call comes in. Greet the caller in Amber's
+// voice, then open a Gather loop.
+voiceRouter.post("/incoming", verifyTwilio, async (req, res, next) => {
+  try {
+    const { From, CallSid } = req.body;
+    console.log("[voice] incoming call", { CallSid, from: From });
+
+    const voice = new Twiml.VoiceResponse();
+    await playReply(voice, "Hey Caleb, it's Amber. What's up?");
+    gatherSpeech(voice);
+    // If gather never fires (silence), loop back to gather once more
+    // before hanging up.
+    voice.redirect({ method: "POST" }, "/voice/respond");
+
+    res.type("text/xml").send(voice.toString());
+  } catch (err) {
+    next(err);
+  }
 });
 
-// Twilio status callback. Log lifecycle events for observability.
+// Twilio posts here with SpeechResult after the caller finishes talking.
+// We ask Amber, TTS the reply, play it, and gather again.
+voiceRouter.post("/respond", verifyTwilio, async (req, res, next) => {
+  try {
+    const { CallSid, From, SpeechResult, Confidence } = req.body;
+    console.log("[voice] respond", {
+      CallSid,
+      confidence: Confidence,
+      length: SpeechResult?.length || 0,
+    });
+
+    const voice = new Twiml.VoiceResponse();
+
+    if (!SpeechResult || SpeechResult.trim().length === 0) {
+      await playReply(voice, "Still there? I didn't catch that.");
+      gatherSpeech(voice);
+      voice.hangup();
+      return res.type("text/xml").send(voice.toString());
+    }
+
+    const reply = await askAmber({
+      callSid: CallSid,
+      caller: From,
+      userText: SpeechResult.trim(),
+    });
+
+    await playReply(voice, reply);
+    gatherSpeech(voice);
+    voice.redirect({ method: "POST" }, "/voice/respond");
+
+    res.type("text/xml").send(voice.toString());
+  } catch (err) {
+    console.error("[voice] respond error", err.message);
+    const voice = new Twiml.VoiceResponse();
+    voice.say("Amber hit a snag. Try calling back in a moment.");
+    voice.hangup();
+    res.type("text/xml").send(voice.toString());
+  }
+});
+
+// Call lifecycle callback. Clear conversation memory when the call ends.
 voiceRouter.post("/status", verifyTwilio, (req, res) => {
-  const { CallSid, CallStatus, From, To, CallDuration } = req.body;
-  console.log("[voice] status", {
-    CallSid,
-    CallStatus,
-    From,
-    To,
-    CallDuration,
-  });
+  const { CallSid, CallStatus, CallDuration } = req.body;
+  console.log("[voice] status", { CallSid, CallStatus, CallDuration });
+  if (["completed", "failed", "canceled", "no-answer"].includes(CallStatus)) {
+    endSession(CallSid);
+  }
   res.sendStatus(204);
 });
