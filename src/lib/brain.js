@@ -38,16 +38,43 @@ export async function askAmber({ callSid, caller, userText }) {
       signal: controller.signal,
     });
 
+    const rawBody = await res.text();
+    const contentType = res.headers.get("content-type") || "";
+    const looksJson = contentType.includes("application/json");
+
     if (!res.ok) {
-      const body = await res.text().catch(() => "");
-      throw new Error(`amber brain ${res.status}: ${body.slice(0, 200)}`);
+      console.warn(
+        `[brain] amber-agent ${res.status}: ${rawBody.slice(0, 160)}`,
+      );
+      return fallbackReply(userText, "backend_error");
     }
 
-    const data = await res.json();
-    if (!data.reply || typeof data.reply !== "string") {
-      throw new Error("amber brain returned no reply field");
+    if (!looksJson) {
+      // amber-agent's default text handler responded — the /api/voice-turn
+      // route isn't deployed yet. Fall back instead of crashing the call.
+      console.warn(
+        "[brain] amber-agent returned non-JSON. Voice-turn route likely missing.",
+      );
+      return fallbackReply(userText, "route_missing");
     }
-    return data.reply;
+
+    let data;
+    try {
+      data = JSON.parse(rawBody);
+    } catch {
+      console.warn("[brain] amber-agent returned malformed JSON");
+      return fallbackReply(userText, "parse_error");
+    }
+
+    if (!data || typeof data.reply !== "string" || !data.reply.trim()) {
+      console.warn("[brain] amber-agent returned no reply field");
+      return fallbackReply(userText, "no_reply");
+    }
+
+    return data.reply.trim();
+  } catch (err) {
+    console.warn("[brain] askAmber failed:", err.message);
+    return fallbackReply(userText, "exception");
   } finally {
     clearTimeout(timer);
   }
@@ -74,12 +101,25 @@ export async function endSession(callSid) {
   }
 }
 
-// Only used when AMBER_AGENT_URL is unset. Keeps the line from dying
-// during local smoke tests before the backend is wired.
-function fallbackReply(userText) {
-  console.warn("[brain] AMBER_AGENT_URL is not set. Responding with fallback.");
-  if (!userText) {
-    return "Amber's backend isn't connected yet. I can't think without it.";
+// Used when the brain backend is unreachable, undeployed, or returns
+// junk. Keeps the call alive so the line never dead-airs.
+function fallbackReply(userText, reason = "no_url") {
+  if (reason === "no_url") {
+    console.warn(
+      "[brain] AMBER_AGENT_URL is not set. Responding with fallback.",
+    );
   }
-  return `I heard you say: ${userText.slice(0, 120)}. But my brain isn't wired up yet, so that's about all I've got.`;
+  const reasons = {
+    no_url: "my backend isn't connected yet",
+    route_missing: "my brain endpoint isn't deployed yet",
+    backend_error: "my brain is having a moment",
+    parse_error: "my brain is having a moment",
+    no_reply: "my brain came back empty",
+    exception: "I lost the line to my brain",
+  };
+  const why = reasons[reason] || "I'm not all here right now";
+  if (!userText) {
+    return `Hey, ${why}. Give me a few minutes and try again.`;
+  }
+  return `I caught that, but ${why}. Try me again in a minute.`;
 }

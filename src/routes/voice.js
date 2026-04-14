@@ -92,7 +92,7 @@ voiceRouter.post("/respond", verifyTwilio, async (req, res, next) => {
     if (!SpeechResult || SpeechResult.trim().length === 0) {
       await playReply(voice, "Still there? I didn't catch that.");
       gatherSpeech(voice);
-      voice.hangup();
+      voice.redirect({ method: "POST" }, "/voice/respond");
       return res.type("text/xml").send(voice.toString());
     }
 
@@ -108,10 +108,23 @@ voiceRouter.post("/respond", verifyTwilio, async (req, res, next) => {
 
     res.type("text/xml").send(voice.toString());
   } catch (err) {
+    // Never hang up on the caller. Apologize, then Gather again so they
+    // can try another turn.
     console.error("[voice] respond error", err.message);
     const voice = new Twiml.VoiceResponse();
-    voice.say("Amber hit a snag. Try calling back in a moment.");
-    voice.hangup();
+    try {
+      await playReply(
+        voice,
+        "Hold on, I lost my train of thought. Say that again?",
+      );
+    } catch {
+      voice.say(
+        { voice: "Polly.Joanna" },
+        "Hold on, I lost my train of thought. Say that again?",
+      );
+    }
+    gatherSpeech(voice);
+    voice.redirect({ method: "POST" }, "/voice/respond");
     res.type("text/xml").send(voice.toString());
   }
 });
