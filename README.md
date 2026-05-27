@@ -94,5 +94,3 @@ npm run dev
 ```
 
 Expose port 3000 with ngrok, set `PUBLIC_URL` to the ngrok URL, set `SKIP_TWILIO_SIGNATURE=true`, and point Twilio at the ngrok `/voice/incoming`.
-
-All glory to God! ✝️❤️
